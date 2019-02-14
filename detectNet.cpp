@@ -29,10 +29,14 @@
 #include "commandLine.h"
 #include "filesystem.h"
 
+#include <opencv2/opencv.hpp>
+
 #define OUTPUT_CVG  0
 #define OUTPUT_BBOX 1
 
-//#define DEBUG_CLUSTERING
+#define DEBUG_CLUSTERING
+// define to replicate the clustering algorithm currently implemented in nvidia caffe's clustering.py layer
+#define REPLICATE_CLUSTERING_PY
 
 
 // constructor
@@ -438,46 +442,6 @@ struct float6 { float x; float y; float z; float w; float v; float u; };
 static inline float6 make_float6( float x, float y, float z, float w, float v, float u ) { float6 f; f.x = x; f.y = y; f.z = z; f.w = w; f.v = v; f.u = u; return f; }
 
 
-inline static bool rectOverlap(const float6& r1, const float6& r2)
-{
-    return ! ( r2.x > r1.z  
-        || r2.z < r1.x
-        || r2.y > r1.w
-        || r2.w < r1.y
-        );
-}
-
-static void mergeRect( std::vector<float6>& rects, const float6& rect )
-{
-	const uint32_t num_rects = rects.size();
-	
-	bool intersects = false;
-	
-	for( uint32_t r=0; r < num_rects; r++ )
-	{
-		if( rectOverlap(rects[r], rect) )
-		{
-			intersects = true;   
-
-#ifdef DEBUG_CLUSTERING
-			printf("found overlap\n");		
-#endif
-
-			if( rect.x < rects[r].x ) 	rects[r].x = rect.x;
-			if( rect.y < rects[r].y ) 	rects[r].y = rect.y;
-			if( rect.z > rects[r].z )	rects[r].z = rect.z;
-			if( rect.w > rects[r].w ) 	rects[r].w = rect.w;
-			
-			break;
-		}
-			
-	} 
-	
-	if( !intersects )
-		rects.push_back(rect);
-}
-
-
 // Detect
 bool detectNet::Detect( float* rgba, uint32_t width, uint32_t height, float* boundingBoxes, int* numBoxes, float* confidence )
 {
@@ -544,10 +508,16 @@ bool detectNet::Detect( float* rgba, uint32_t width, uint32_t height, float* bou
 	std::vector< std::vector<float6> > rects;
 	rects.resize(cls);
 	
+    #ifdef REPLICATE_CLUSTERING_PY
+        printf("Replicating clustering.py logic\n");
+    #else
+        printf("Using correct opencv interface\n");
+    #endif
 	// extract and cluster the raw bounding boxes that meet the coverage threshold
 	for( uint32_t z=0; z < cls; z++ )
 	{
-		rects[z].reserve(owh);
+        std::vector<cv::Rect> candidates;
+        std::vector<float> coverages;
 		
 		for( uint32_t y=0; y < oh; y++ )
 		{
@@ -565,13 +535,61 @@ bool detectNet::Detect( float* rgba, uint32_t width, uint32_t height, float* bou
 					const float x2 = (net_rects[2 * owh + y * ow + x] + mx) * scale_x;	// right
 					const float y2 = (net_rects[3 * owh + y * ow + x] + my) * scale_y;	// bottom 
 					
-				#ifdef DEBUG_CLUSTERING
-					printf("rect x=%u y=%u  cvg=%f  %f %f   %f %f \n", x, y, coverage, x1, x2, y1, y2);
-				#endif					
-					mergeRect( rects[z], make_float6(x1, y1, x2, y2, coverage, z) );
+                    #ifdef REPLICATE_CLUSTERING_PY
+                        // intentially calling the cv::Rect constructor with x2 as height and y2 as width.
+                        // that is what clustering.py does
+                        candidates.emplace_back(x1, y1, x2, y2);
+                        #ifdef DEBUG_CLUSTERING
+                            // create a cut-n-paste python list
+                            printf("[%f, %f, %f, %f],\n", x1, y1, x2, y2); 
+                        #endif					
+                    #else
+                        candidates.emplace_back(cv::Point(x1, y1), cv::Point(x2, y2));
+                        #ifdef DEBUG_CLUSTERING
+                            // create a cut-n-paste python list
+                            printf("[%f, %f, %f, %f],\n", x1, y1, x2-x1, y2-y1);
+                        #endif					
+                    #endif
+                    coverages.emplace_back(coverage);
 				}
 			}
 		}
+
+        // based off of caffe clustering.py layer
+        static const int RECTANGLE_THRESHOLD = 3;
+        static const double RECTANGLE_EPSILON = 0.02;
+        static const int MIN_DETECTION_HEIGHT = 22;
+
+        std::vector<int> weights(candidates.size());
+        cv::groupRectangles(candidates, weights, RECTANGLE_THRESHOLD, RECTANGLE_EPSILON); 
+        coverages.resize(candidates.size());
+        for (auto idx = 0u; idx < candidates.size(); )
+        {
+            const auto& candidate = candidates[idx];
+            auto& coverage = coverages[idx];
+            if (candidate.height >= MIN_DETECTION_HEIGHT)
+            {
+                coverage = log(weights[idx]);
+				#ifdef DEBUG_CLUSTERING
+				    printf("bbox (%u, %u) (%u, %u)  cvg=%f\n", candidate.tl().x, candidate.tl().y, candidate.br().x, candidate.br().y, coverage);
+                #endif 
+                #ifdef REPLICATE_CLUSTERING_PY
+                    // convert back to x1, y1, x2, y2 values
+		            rects[z].push_back(make_float6(candidate.tl().x, candidate.tl().y, candidate.width, candidate.height, coverage, z));
+                #else
+		            rects[z].push_back(make_float6(candidate.tl().x, candidate.tl().y, candidate.br().x, candidate.br().y, coverage, z));
+                #endif
+                ++idx;
+            }
+            else
+            {
+				#ifdef DEBUG_CLUSTERING
+				    printf("ignoring (%u, %u) (%u, %u)  cvg=%f\n", candidate.tl().x, candidate.tl().y, candidate.br().x, candidate.br().y, coverage);
+                #endif 
+                candidates.erase(candidates.begin()+idx);
+                coverages.erase(coverages.begin()+idx);
+            }
+        }
 	}
 	
 	//printf("done clustering rects\n");

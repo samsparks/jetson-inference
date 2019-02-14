@@ -39,6 +39,8 @@ if( ${BUILD_DEPS} )
 	message("-- Finished installing dependencies")
 endif()
 
+find_package( OpenCV REQUIRED )
+message("-- OpenCV version: ${OpenCV_VERSION}")
 
 # setup CUDA
 find_package(CUDA)
@@ -86,7 +88,7 @@ file(GLOB inferenceSources *.cpp *.cu calibration/*.cpp)
 file(GLOB inferenceIncludes *.h calibration/*.h)
 
 cuda_add_library(jetson-inference SHARED ${inferenceSources})
-target_link_libraries(jetson-inference nvcaffe_parser nvinfer)		# gstreamer-0.10 gstbase-0.10 gstapp-0.10 
+target_link_libraries(jetson-inference nvcaffe_parser nvinfer opencv_core opencv_objdetect)		# gstreamer-0.10 gstbase-0.10 gstapp-0.10 
 
 
 # transfer all headers to the include directory
